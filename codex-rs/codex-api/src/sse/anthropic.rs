@@ -146,9 +146,10 @@ async fn process_anthropic_sse(
             "message_start" => {
                 full_text.clear();
                 if let Some(message) = value.get("message")
-                    && let Some(id) = message.get("id").and_then(Value::as_str) {
-                        response_id = Some(id.to_string());
-                    }
+                    && let Some(id) = message.get("id").and_then(Value::as_str)
+                {
+                    response_id = Some(id.to_string());
+                }
             }
             "content_block_start" => {
                 if let Some(content_block) = value.get("content_block") {
@@ -159,10 +160,10 @@ async fn process_anthropic_sse(
                     if block_type == "tool_use"
                         && let Err(err) =
                             handle_tool_use_block(&tx_event, content_block.to_owned()).await
-                        {
-                            let _ = tx_event.send(Err(err)).await;
-                            return;
-                        }
+                    {
+                        let _ = tx_event.send(Err(err)).await;
+                        return;
+                    }
                 }
             }
             "content_block_delta" => {
@@ -171,13 +172,14 @@ async fn process_anthropic_sse(
                     if (delta_type == Some("text")
                         || delta_type == Some("text_delta")
                         || delta_type.is_none())
-                        && let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            full_text.push_str(text);
-                            let event = ResponseEvent::OutputTextDelta(text.to_string());
-                            if tx_event.send(Ok(event)).await.is_err() {
-                                return;
-                            }
+                        && let Some(text) = delta.get("text").and_then(Value::as_str)
+                    {
+                        full_text.push_str(text);
+                        let event = ResponseEvent::OutputTextDelta(text.to_string());
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            return;
                         }
+                    }
                 }
             }
             "message_delta" => {}
@@ -185,9 +187,10 @@ async fn process_anthropic_sse(
             "message_stop" => {
                 if let Some(message) = value.get("message") {
                     if response_id.is_none()
-                        && let Some(id) = message.get("id").and_then(Value::as_str) {
-                            response_id = Some(id.to_string());
-                        }
+                        && let Some(id) = message.get("id").and_then(Value::as_str)
+                    {
+                        response_id = Some(id.to_string());
+                    }
                     if let Some(message_usage) = extract_usage(message) {
                         usage = Some(message_usage);
                     }
@@ -239,14 +242,15 @@ fn extract_usage(value: &Value) -> Option<TokenUsage> {
 
 fn build_error_message(value: &Value) -> String {
     if let Some(err_val) = value.get("error")
-        && let Ok(body) = serde_json::from_value::<AnthropicErrorBody>(err_val.clone()) {
-            let kind = body.kind.unwrap_or_else(|| "unknown".to_string());
-            let message = body.message.unwrap_or_default();
-            if let Some(code) = body.code {
-                return format!("Anthropic error {kind} ({code}): {message}");
-            }
-            return format!("Anthropic error {kind}: {message}");
+        && let Ok(body) = serde_json::from_value::<AnthropicErrorBody>(err_val.clone())
+    {
+        let kind = body.kind.unwrap_or_else(|| "unknown".to_string());
+        let message = body.message.unwrap_or_default();
+        if let Some(code) = body.code {
+            return format!("Anthropic error {kind} ({code}): {message}");
         }
+        return format!("Anthropic error {kind}: {message}");
+    }
 
     format!("Anthropic error event: {value}")
 }

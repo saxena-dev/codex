@@ -3,6 +3,8 @@ use crate::error::Result;
 use crate::openai_models::model_family::ModelFamily;
 pub use codex_api::common::ResponseEvent;
 use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use futures::Stream;
 use serde::Deserialize;
@@ -179,10 +181,170 @@ fn strip_total_output_header(output: &str) -> Option<(&str, u32)> {
     Some((remainder, total_lines))
 }
 
+/// Builds an Anthropic Messages request body from the core `Prompt`.
+///
+/// This is an Anthropic-specific helper that keeps existing OpenAI payload
+/// builders unchanged. It maps Codex `ResponseItem` history and tools into
+/// the minimal Messages request shape:
+///   - `model` comes from the configured model slug.
+///   - `system` is derived from `Prompt::get_full_instructions`.
+///   - `messages` encodes user/assistant text, function calls, and tool
+///     results using Anthropic's content blocks.
+///   - `tools` is produced by the Anthropic tools helper, which currently
+///     returns an empty vector and will be fleshed out in a follow-up task.
+///   - `tool_choice` is `"auto"` when parallel tool calls are enabled and
+///     `null` otherwise.
+///   - `max_tokens` is derived from the model family's effective context
+///     window when available, or falls back to a conservative default.
+///   - `stream` is always `true` to enable SSE.
+pub fn build_anthropic_messages_body(
+    prompt: &Prompt,
+    model: &str,
+    model_family: &ModelFamily,
+) -> Result<Value> {
+    let system = prompt.get_full_instructions(model_family).into_owned();
+    let formatted_input = prompt.get_formatted_input();
+    let messages = response_items_to_anthropic_messages(&formatted_input);
+    let tools = tools::create_tools_json_for_anthropic_messages(&prompt.tools)?;
+    let tool_choice = if prompt.parallel_tool_calls {
+        Value::String("auto".to_string())
+    } else {
+        Value::Null
+    };
+    let max_tokens = compute_anthropic_max_tokens(model_family);
+
+    Ok(serde_json::json!({
+        "model": model,
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "max_tokens": max_tokens,
+        "stream": true,
+    }))
+}
+
+fn compute_anthropic_max_tokens(model_family: &ModelFamily) -> i64 {
+    // Anthropic requires `max_tokens > 0`. For now, derive a simple upper
+    // bound from the effective context window when available, reserving
+    // roughly three quarters of the window for input and overhead and one
+    // quarter for output. When no context window is known, fall back to a
+    // conservative default.
+    const DEFAULT_MAX_TOKENS: i64 = 1_024;
+
+    let effective_context_window = model_family
+        .context_window
+        .map(|w| w.saturating_mul(model_family.effective_context_window_percent) / 100);
+
+    let candidate = effective_context_window
+        .map(|effective| effective / 4)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+
+    if candidate > 0 {
+        candidate
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
+}
+
+fn response_items_to_anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
+    let mut messages = Vec::new();
+
+    for item in items {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let content_blocks: Vec<Value> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            Some(serde_json::json!({
+                                "type": "text",
+                                "text": text,
+                            }))
+                        }
+                        ContentItem::InputImage { .. } => None,
+                    })
+                    .collect();
+
+                if !content_blocks.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": role,
+                        "content": content_blocks,
+                    }));
+                }
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                let input = serde_json::from_str(arguments).unwrap_or(Value::Null);
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": name,
+                        "input": input,
+                    }],
+                }));
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let inner_content: Vec<Value> = if let Some(items) = &output.content_items {
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": text,
+                                })
+                            }
+                            FunctionCallOutputContentItem::InputImage { image_url } => {
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": image_url,
+                                })
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec![serde_json::json!({
+                        "type": "text",
+                        "text": output.content,
+                    })]
+                };
+
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": inner_content,
+                    }],
+                }));
+            }
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::CompactionSummary { .. }
+            | ResponseItem::Other => {}
+        }
+    }
+
+    messages
+}
+
 pub(crate) mod tools {
+    use crate::error::Result;
     use crate::tools::spec::JsonSchema;
     use serde::Deserialize;
     use serde::Serialize;
+    use serde_json::Value;
 
     /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
     /// Responses API.
@@ -236,6 +398,17 @@ pub(crate) mod tools {
         pub(crate) strict: bool,
         pub(crate) parameters: JsonSchema,
     }
+
+    /// Builds Anthropic Messages tool definitions from core `ToolSpec`s.
+    ///
+    /// This helper is intentionally minimal for the initial Anthropic
+    /// integration and currently returns an empty `tools` array. A follow-up
+    /// task will flesh out the mapping to Anthropic's `input_schema` format.
+    pub(crate) fn create_tools_json_for_anthropic_messages(
+        _tools: &[ToolSpec],
+    ) -> Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct ResponseStream {
@@ -257,6 +430,10 @@ mod tests {
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_api::create_text_param_for_request;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -323,6 +500,164 @@ mod tests {
             let full = prompt.get_full_instructions(&model_family);
             assert_eq!(full, expected);
         }
+    }
+
+    #[test]
+    fn anthropic_body_includes_user_and_assistant_messages() {
+        let model_family = find_family_for_model("gpt-5.1");
+        let mut prompt = Prompt::default();
+        prompt.input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "world".to_string(),
+                }],
+            },
+        ];
+
+        let body = build_anthropic_messages_body(&prompt, "test-model", &model_family)
+            .expect("anthropic body");
+        let messages = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].get("role").and_then(|r| r.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            messages[0]
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str()),
+            Some("hello")
+        );
+        assert_eq!(
+            messages[1].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        assert_eq!(
+            messages[1]
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str()),
+            Some("world")
+        );
+
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .expect("max_tokens");
+        assert!(max_tokens > 0);
+        assert_eq!(
+            body.get("model").and_then(|m| m.as_str()),
+            Some("test-model")
+        );
+        assert_eq!(body.get("stream").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn anthropic_body_maps_function_call_and_result() {
+        let model_family = find_family_for_model("gpt-5.1");
+        let mut prompt = Prompt::default();
+        prompt.input = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "my_tool".to_string(),
+                arguments: r#"{"arg":"value"}"#.to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "result".to_string(),
+                    content_items: Some(vec![FunctionCallOutputContentItem::InputText {
+                        text: "result".to_string(),
+                    }]),
+                    success: Some(true),
+                },
+            },
+        ];
+
+        let body = build_anthropic_messages_body(&prompt, "test-model", &model_family)
+            .expect("anthropic body");
+        let messages = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+
+        assert_eq!(messages.len(), 2);
+
+        let tool_use = messages[0]
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .expect("tool_use block");
+        assert_eq!(
+            messages[0].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        assert_eq!(
+            tool_use.get("type").and_then(|t| t.as_str()),
+            Some("tool_use")
+        );
+        assert_eq!(tool_use.get("id").and_then(|v| v.as_str()), Some("call-1"));
+        assert_eq!(
+            tool_use.get("name").and_then(|v| v.as_str()),
+            Some("my_tool")
+        );
+        assert_eq!(
+            tool_use
+                .get("input")
+                .and_then(|i| i.get("arg"))
+                .and_then(|v| v.as_str()),
+            Some("value")
+        );
+
+        let tool_result = messages[1]
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .expect("tool_result block");
+        assert_eq!(
+            messages[1].get("role").and_then(|r| r.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            tool_result.get("type").and_then(|t| t.as_str()),
+            Some("tool_result")
+        );
+        assert_eq!(
+            tool_result.get("tool_use_id").and_then(|v| v.as_str()),
+            Some("call-1")
+        );
+        let result_content = tool_result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .expect("tool_result content block");
+        assert_eq!(
+            result_content.get("type").and_then(|t| t.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            result_content.get("text").and_then(|t| t.as_str()),
+            Some("result")
+        );
     }
 
     #[test]

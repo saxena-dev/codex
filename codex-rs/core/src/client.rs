@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use codex_api::AggregateStreamExt;
+use codex_api::AnthropicMessagesClient as ApiAnthropicMessagesClient;
 use codex_api::ChatClient as ApiChatClient;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
@@ -41,6 +42,7 @@ use crate::auth::RefreshTokenError;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_common::build_anthropic_messages_body;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
@@ -115,9 +117,7 @@ impl ModelClient {
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses_api(prompt).await,
-            WireApi::AnthropicMessages => Err(CodexErr::UnsupportedOperation(
-                "Anthropic Messages wire_api is not implemented yet".to_string(),
-            )),
+            WireApi::AnthropicMessages => self.stream_anthropic_messages_api(prompt).await,
             WireApi::Chat => {
                 let api_stream = self.stream_chat_completions(prompt).await?;
 
@@ -178,6 +178,62 @@ impl ModelClient {
 
             match stream_result {
                 Ok(stream) => return Ok(stream),
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UNAUTHORIZED =>
+                {
+                    handle_unauthorized(status, &mut refreshed, &auth_manager, &auth).await?;
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    /// Streams a turn via the Anthropic Messages API.
+    ///
+    /// This path is only used when the provider is configured with
+    /// `WireApi::AnthropicMessages`. Anthropic SSE events are already mapped
+    /// into `ResponseEvent` inside `codex-api`; this method adapts the
+    /// codex-api stream into the core `ResponseStream`.
+    async fn stream_anthropic_messages_api(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        let auth_manager = self.auth_manager.clone();
+        let model_family = self.get_model_family();
+        let model = self.get_model();
+        let body = build_anthropic_messages_body(prompt, &model, &model_family)?;
+
+        let mut refreshed = false;
+        loop {
+            let auth = auth_manager.as_ref().and_then(|m| m.auth());
+            let api_provider = self
+                .provider
+                .to_api_provider(auth.as_ref().map(|a| a.mode))?;
+            let api_auth = auth_provider_from_auth(auth.clone(), &self.provider).await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let (request_telemetry, sse_telemetry) = self.build_streaming_telemetry();
+            let client = ApiAnthropicMessagesClient::new(transport, api_provider, api_auth)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            let mut extra_headers = ApiHeaderMap::new();
+            if let SessionSource::SubAgent(sub) = &self.session_source {
+                let subagent = if let crate::protocol::SubAgentSource::Other(label) = sub {
+                    label.clone()
+                } else {
+                    serde_json::to_value(sub)
+                        .ok()
+                        .and_then(|v| v.as_str().map(std::string::ToString::to_string))
+                        .unwrap_or_else(|| "other".to_string())
+                };
+                if let Ok(val) = HeaderValue::from_str(&subagent) {
+                    extra_headers.insert("x-openai-subagent", val);
+                }
+            }
+
+            let stream_result = client.stream(body.clone(), extra_headers.clone()).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    return Ok(map_response_stream(stream, self.otel_event_manager.clone()));
+                }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UNAUTHORIZED =>
                 {
