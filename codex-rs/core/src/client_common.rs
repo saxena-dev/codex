@@ -206,7 +206,8 @@ pub fn build_anthropic_messages_body(
     let formatted_input = prompt.get_formatted_input();
     let messages = response_items_to_anthropic_messages(&formatted_input);
     let tools = tools::create_tools_json_for_anthropic_messages(&prompt.tools)?;
-    let tool_choice = if prompt.parallel_tool_calls {
+    let has_tools = !tools.is_empty();
+    let tool_choice = if has_tools && prompt.parallel_tool_calls {
         Value::String("auto".to_string())
     } else {
         Value::Null
@@ -405,9 +406,22 @@ pub(crate) mod tools {
     /// integration and currently returns an empty `tools` array. A follow-up
     /// task will flesh out the mapping to Anthropic's `input_schema` format.
     pub(crate) fn create_tools_json_for_anthropic_messages(
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
     ) -> Result<Vec<Value>> {
-        Ok(Vec::new())
+        let mut tools_json = Vec::new();
+
+        for tool in tools {
+            if let ToolSpec::Function(function) = tool {
+                let schema_value = serde_json::to_value(&function.parameters)?;
+                tools_json.push(serde_json::json!({
+                    "name": function.name,
+                    "description": function.description,
+                    "input_schema": schema_value,
+                }));
+            }
+        }
+
+        Ok(tools_json)
     }
 }
 
@@ -426,6 +440,7 @@ impl Stream for ResponseStream {
 #[cfg(test)]
 mod tests {
     use crate::openai_models::model_family::find_family_for_model;
+    use crate::tools::spec::JsonSchema;
     use codex_api::ResponsesApiRequest;
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
@@ -437,6 +452,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::client_common::tools::ResponsesApiTool;
+    use crate::client_common::tools::ToolSpec as PromptToolSpec;
 
     struct InstructionsTestCase {
         pub slug: &'static str,
@@ -567,7 +584,157 @@ mod tests {
             body.get("model").and_then(|m| m.as_str()),
             Some("test-model")
         );
-        assert_eq!(body.get("stream").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            body.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn anthropic_tools_json_includes_function_tools_only() {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(
+            "arg".to_string(),
+            JsonSchema::String {
+                description: Some("argument".to_string()),
+            },
+        );
+        let schema = JsonSchema::Object {
+            properties,
+            required: Some(vec!["arg".to_string()]),
+            additional_properties: Some(false.into()),
+        };
+        let expected_schema =
+            serde_json::to_value(&schema).expect("serialize expected json schema");
+
+        let function_tool = PromptToolSpec::Function(ResponsesApiTool {
+            name: "test_tool".to_string(),
+            description: "test description".to_string(),
+            strict: false,
+            parameters: schema,
+        });
+        let non_function_tool = PromptToolSpec::LocalShell {};
+
+        let tools = vec![function_tool, non_function_tool];
+
+        let tools_json =
+            tools::create_tools_json_for_anthropic_messages(&tools).expect("tools json");
+
+        assert_eq!(tools_json.len(), 1);
+
+        let entry = &tools_json[0];
+        assert_eq!(
+            entry.get("name").and_then(|v| v.as_str()),
+            Some("test_tool")
+        );
+        assert_eq!(
+            entry.get("description").and_then(|v| v.as_str()),
+            Some("test description")
+        );
+
+        let input_schema = entry
+            .get("input_schema")
+            .expect("input_schema field present");
+        assert_eq!(input_schema, &expected_schema);
+    }
+
+    #[test]
+    fn anthropic_body_includes_tools_and_tool_choice_auto_when_parallel() {
+        let model_family = find_family_for_model("gpt-5.1");
+        let mut prompt = Prompt::default();
+
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(
+            "arg".to_string(),
+            JsonSchema::String {
+                description: Some("argument".to_string()),
+            },
+        );
+        let schema = JsonSchema::Object {
+            properties,
+            required: Some(vec!["arg".to_string()]),
+            additional_properties: Some(false.into()),
+        };
+
+        prompt.tools = vec![PromptToolSpec::Function(ResponsesApiTool {
+            name: "test_tool".to_string(),
+            description: "test description".to_string(),
+            strict: false,
+            parameters: schema.clone(),
+        })];
+        prompt.parallel_tool_calls = true;
+
+        let body = build_anthropic_messages_body(&prompt, "test-model", &model_family)
+            .expect("anthropic body with tools");
+
+        let tools = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        assert_eq!(tools.len(), 1);
+
+        let entry = &tools[0];
+        assert_eq!(
+            entry.get("name").and_then(|v| v.as_str()),
+            Some("test_tool")
+        );
+        assert_eq!(
+            entry.get("description").and_then(|v| v.as_str()),
+            Some("test description")
+        );
+
+        let input_schema = entry
+            .get("input_schema")
+            .expect("input_schema field present");
+        let expected_schema =
+            serde_json::to_value(&schema).expect("serialize expected json schema");
+        assert_eq!(input_schema, &expected_schema);
+
+        assert_eq!(
+            body.get("tool_choice").and_then(|v| v.as_str()),
+            Some("auto")
+        );
+    }
+
+    #[test]
+    fn anthropic_body_includes_tools_and_null_tool_choice_when_not_parallel() {
+        let model_family = find_family_for_model("gpt-5.1");
+        let mut prompt = Prompt::default();
+
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(
+            "arg".to_string(),
+            JsonSchema::String {
+                description: Some("argument".to_string()),
+            },
+        );
+        let schema = JsonSchema::Object {
+            properties,
+            required: Some(vec!["arg".to_string()]),
+            additional_properties: Some(false.into()),
+        };
+
+        prompt.tools = vec![PromptToolSpec::Function(ResponsesApiTool {
+            name: "test_tool".to_string(),
+            description: "test description".to_string(),
+            strict: false,
+            parameters: schema,
+        })];
+        prompt.parallel_tool_calls = false;
+
+        let body = build_anthropic_messages_body(&prompt, "test-model", &model_family)
+            .expect("anthropic body with tools");
+
+        let tools = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        assert_eq!(tools.len(), 1);
+
+        assert!(
+            body.get("tool_choice")
+                .is_some_and(serde_json::Value::is_null)
+        );
     }
 
     #[test]

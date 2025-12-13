@@ -141,7 +141,10 @@ async fn anthropic_messages_streams_to_messages_endpoint() {
 
     assert!(body.get("model").and_then(|m| m.as_str()).is_some());
     assert!(body.get("system").and_then(|s| s.as_str()).is_some());
-    assert_eq!(body.get("stream").and_then(serde_json::Value::as_bool), Some(true));
+    assert_eq!(
+        body.get("stream").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
 
     let messages = body
         .get("messages")
