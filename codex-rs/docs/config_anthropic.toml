@@ -1,0 +1,51 @@
+# Sample Codex config to use Anthropic Claude models
+# hosted on Azure AI Foundry via the Anthropic Messages API.
+#
+# This file is intended for local testing and experimentation.
+# Copy any relevant sections into your real `$CODEX_HOME/config.toml`.
+
+# Select the Claude-on-Azure provider and model.
+# The `model` value should be a Claude model id supported by Anthropic
+# Messages on Azure (for example, a Claude Sonnet 4.5 variant).
+model_provider = "claude_azure"
+model = "claude-sonnet-4.5"
+
+[model_providers.claude_azure]
+name = "Claude (Azure AI Foundry)"
+
+# Base URL for Anthropic Messages on Azure AI Foundry.
+# From Microsoft documentation for Claude on Foundry:
+#   base URL:  https://<resource-name>.services.ai.azure.com/anthropic
+#   messages:  https://<resource-name>.services.ai.azure.com/anthropic/v1/messages
+#
+# Codex appends `/messages` to the provider base URL when using the
+# Anthropic Messages wire API, so set `base_url` to the `/anthropic/v1`
+# prefix to match the deployed model's Messages endpoint.
+base_url = "https://<resource-name>.services.ai.azure.com/anthropic/v1"
+
+# Use the Anthropic Messages wire API in Codex.
+# This routes through `ModelClient::stream_anthropic_messages_api` and
+# `codex-api`'s AnthropicMessagesClient instead of OpenAI Responses/Chat.
+wire_api = "anthropic-messages"
+
+# Required Anthropic headers. For Messages API calls, Anthropic expects:
+#   - `Content-Type: application/json`
+#   - `anthropic-version: "2023-06-01"` (or newer)
+#   - An API key header (`x-api-key`) or Entra ID bearer token.
+# Azure AI Foundry fronts the Anthropic Messages endpoint, but the header
+# contract remains Anthropic-compatible.
+http_headers = { anthropic-version = "2023-06-01" }
+
+# Map your Azure Claude deployment API key into the `x-api-key` header.
+# Per the Microsoft docs, define an `AZURE_API_KEY` environment variable:
+#   export AZURE_API_KEY="<your-api-key>"
+#
+# Codex will then send:
+#   x-api-key: $AZURE_API_KEY
+env_http_headers = { "x-api-key" = "AZURE_API_KEY" }
+
+# Optional per-provider retry/timeout tuning. Uncomment and adjust as needed.
+# request_max_retries     = 4        # HTTP request retries (default: 4)
+# stream_max_retries      = 5        # SSE reconnection attempts (default: 5)
+# stream_idle_timeout_ms  = 300000   # 5 minutes (default: 300_000)
+
