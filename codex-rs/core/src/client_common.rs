@@ -190,10 +190,9 @@ fn strip_total_output_header(output: &str) -> Option<(&str, u32)> {
 ///   - `system` is derived from `Prompt::get_full_instructions`.
 ///   - `messages` encodes user/assistant text, function calls, and tool
 ///     results using Anthropic's content blocks.
-///   - `tools` is produced by the Anthropic tools helper, which currently
-///     returns an empty vector and will be fleshed out in a follow-up task.
-///   - `tool_choice` is `"auto"` when parallel tool calls are enabled and
-///     `null` otherwise.
+///   - `tools` is produced by the Anthropic tools helper.
+///   - `tool_choice` is set to `{ "type": "auto" }` when parallel tool calls
+///     are enabled and at least one tool is available; otherwise it is omitted.
 ///   - `max_tokens` is derived from the model family's effective context
 ///     window when available, or falls back to a conservative default.
 ///   - `stream` is always `true` to enable SSE.
@@ -208,21 +207,26 @@ pub fn build_anthropic_messages_body(
     let tools = tools::create_tools_json_for_anthropic_messages(&prompt.tools)?;
     let has_tools = !tools.is_empty();
     let tool_choice = if has_tools && prompt.parallel_tool_calls {
-        Value::String("auto".to_string())
+        Some(serde_json::json!({ "type": "auto" }))
     } else {
-        Value::Null
+        None
     };
     let max_tokens = compute_anthropic_max_tokens(model_family);
 
-    Ok(serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "system": system,
         "messages": messages,
         "tools": tools,
-        "tool_choice": tool_choice,
         "max_tokens": max_tokens,
         "stream": true,
-    }))
+    });
+
+    if let Some(choice) = tool_choice {
+        body["tool_choice"] = choice;
+    }
+
+    Ok(body)
 }
 
 fn compute_anthropic_max_tokens(model_family: &ModelFamily) -> i64 {
@@ -690,8 +694,11 @@ mod tests {
             serde_json::to_value(&schema).expect("serialize expected json schema");
         assert_eq!(input_schema, &expected_schema);
 
+        let tool_choice = body.get("tool_choice").expect(
+            "tool_choice should be present when parallel_tool_calls is true and tools exist",
+        );
         assert_eq!(
-            body.get("tool_choice").and_then(|v| v.as_str()),
+            tool_choice.get("type").and_then(|v| v.as_str()),
             Some("auto")
         );
     }
@@ -732,8 +739,8 @@ mod tests {
         assert_eq!(tools.len(), 1);
 
         assert!(
-            body.get("tool_choice")
-                .is_some_and(serde_json::Value::is_null)
+            body.get("tool_choice").is_none(),
+            "tool_choice should be omitted when parallel_tool_calls is false"
         );
     }
 

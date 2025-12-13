@@ -76,6 +76,7 @@ async fn process_anthropic_sse(
     let mut response_id: Option<String> = None;
     let mut usage: Option<TokenUsage> = None;
     let mut completed_sent = false;
+    let mut text_item_started = false;
 
     loop {
         let start = Instant::now();
@@ -145,6 +146,7 @@ async fn process_anthropic_sse(
         match kind {
             "message_start" => {
                 full_text.clear();
+                text_item_started = false;
                 if let Some(message) = value.get("message")
                     && let Some(id) = message.get("id").and_then(Value::as_str)
                 {
@@ -174,6 +176,25 @@ async fn process_anthropic_sse(
                         || delta_type.is_none())
                         && let Some(text) = delta.get("text").and_then(Value::as_str)
                     {
+                        if !text_item_started {
+                            // Emit an OutputItemAdded for the assistant message the first
+                            // time we see a text delta so downstream consumers have an
+                            // active item to attach deltas to.
+                            let item = ResponseItem::Message {
+                                id: None,
+                                role: "assistant".to_string(),
+                                content: vec![],
+                            };
+                            text_item_started = true;
+                            if tx_event
+                                .send(Ok(ResponseEvent::OutputItemAdded(item)))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+
                         full_text.push_str(text);
                         let event = ResponseEvent::OutputTextDelta(text.to_string());
                         if tx_event.send(Ok(event)).await.is_err() {

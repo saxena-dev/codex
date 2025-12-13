@@ -110,23 +110,30 @@ async fn anthropic_text_only_stream_emits_deltas_and_completion() -> Result<()> 
         .filter(|ev| !matches!(ev, ResponseEvent::RateLimits(_)))
         .collect();
 
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
 
     match &events[0] {
-        ResponseEvent::OutputTextDelta(text) => {
-            assert_eq!(text, "Hello, ");
+        ResponseEvent::OutputItemAdded(ResponseItem::Message { role, .. }) => {
+            assert_eq!(role, "assistant");
         }
         other => panic!("unexpected first event: {other:?}"),
     }
 
     match &events[1] {
         ResponseEvent::OutputTextDelta(text) => {
-            assert_eq!(text, "world");
+            assert_eq!(text, "Hello, ");
         }
         other => panic!("unexpected second event: {other:?}"),
     }
 
     match &events[2] {
+        ResponseEvent::OutputTextDelta(text) => {
+            assert_eq!(text, "world");
+        }
+        other => panic!("unexpected third event: {other:?}"),
+    }
+
+    match &events[3] {
         ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
             assert_eq!(role, "assistant");
             let mut aggregated = String::new();
@@ -137,10 +144,10 @@ async fn anthropic_text_only_stream_emits_deltas_and_completion() -> Result<()> 
             }
             assert_eq!(aggregated, "Hello, world");
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
 
-    match &events[3] {
+    match &events[4] {
         ResponseEvent::Completed {
             response_id,
             token_usage,
@@ -155,7 +162,7 @@ async fn anthropic_text_only_stream_emits_deltas_and_completion() -> Result<()> 
             assert_eq!(usage.reasoning_output_tokens, 0);
             assert_eq!(usage.total_tokens, 30);
         }
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected fifth event: {other:?}"),
     }
 
     Ok(())
