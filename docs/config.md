@@ -89,7 +89,8 @@ base_url = "https://api.openai.com/v1"
 # using Codex with this provider. The value of the environment variable must be
 # non-empty and will be used in the `Bearer TOKEN` HTTP header for the POST request.
 env_key = "OPENAI_API_KEY"
-# Valid values for wire_api are "chat" and "responses". Defaults to "chat" if omitted.
+# Valid values for wire_api are "chat", "responses", and "anthropic-messages".
+# Defaults to "chat" if omitted.
 wire_api = "chat"
 # If necessary, extra query params that need to be added to the URL.
 # See the Azure example below.
@@ -128,6 +129,26 @@ http_headers = { "X-Example-Header" = "example-value" }
 # _if_ the environment variable is set and its value is non-empty.
 env_http_headers = { "X-Example-Features" = "EXAMPLE_FEATURES" }
 ```
+
+#### Anthropic (Claude) provider example
+
+To use Anthropic Claude via the Messages API, configure a provider that uses the `anthropic-messages` wire API and supplies the required headers:
+
+```toml
+[model_providers.claude]
+name = "Anthropic"
+base_url = "https://api.anthropic.com/v1"
+wire_api = "anthropic-messages"
+http_headers     = { "anthropic-version" = "2023-06-01" }
+env_http_headers = { "x-api-key" = "ANTHROPIC_API_KEY" }
+```
+
+In this configuration:
+
+- `wire_api = "anthropic-messages"` activates the Anthropic Messages wire path.
+- `anthropic-version` is sent as a static HTTP header.
+- `x-api-key` is populated from the `ANTHROPIC_API_KEY` environment variable via `env_http_headers`.
+- Anthropic does not use ChatGPT/OpenAI OAuth in this integration; it relies on the HTTP `x-api-key` header instead.
 
 #### Azure model provider example
 

@@ -42,6 +42,9 @@ impl<T: HttpTransport, A: AuthProvider> CompactClient<T, A> {
             WireApi::Chat => Err(ApiError::Stream(
                 "compact endpoint requires responses wire api".to_string(),
             )),
+            WireApi::AnthropicMessages => Err(ApiError::Stream(
+                "compact endpoint does not support anthropic-messages wire api".to_string(),
+            )),
         }
     }
 

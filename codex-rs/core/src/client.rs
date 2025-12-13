@@ -115,6 +115,9 @@ impl ModelClient {
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses_api(prompt).await,
+            WireApi::AnthropicMessages => Err(CodexErr::UnsupportedOperation(
+                "Anthropic Messages wire_api is not implemented yet".to_string(),
+            )),
             WireApi::Chat => {
                 let api_stream = self.stream_chat_completions(prompt).await?;
 

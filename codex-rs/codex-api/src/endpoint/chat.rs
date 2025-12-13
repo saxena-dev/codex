@@ -70,7 +70,10 @@ impl<T: HttpTransport, A: AuthProvider> ChatClient<T, A> {
     fn path(&self) -> &'static str {
         match self.streaming.provider().wire {
             WireApi::Chat => "chat/completions",
-            _ => "responses",
+            WireApi::Responses | WireApi::Compact => "responses",
+            WireApi::AnthropicMessages => {
+                unreachable!("ChatClient should not be constructed with AnthropicMessages wire api")
+            }
         }
     }
 

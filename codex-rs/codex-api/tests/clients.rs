@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use codex_api::AnthropicMessagesClient;
 use codex_api::AuthProvider;
 use codex_api::ChatClient;
 use codex_api::Provider;
@@ -311,5 +312,23 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
 
     let _stream = client.stream_prompt("gpt-test", &prompt, options).await?;
     assert_eq!(transport.attempts(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn anthropic_messages_client_uses_messages_path_for_anthropic_wire() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = AnthropicMessagesClient::new(
+        transport,
+        provider("anthropic", WireApi::AnthropicMessages),
+        NoAuth,
+    );
+
+    let body = serde_json::json!({ "echo": true });
+    let _stream = client.stream(body, HeaderMap::new()).await?;
+
+    let requests = state.take_stream_requests();
+    assert_path_ends_with(&requests, "/messages");
     Ok(())
 }

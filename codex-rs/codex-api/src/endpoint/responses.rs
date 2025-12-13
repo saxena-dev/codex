@@ -92,6 +92,11 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         match self.streaming.provider().wire {
             WireApi::Responses | WireApi::Compact => "responses",
             WireApi::Chat => "chat/completions",
+            WireApi::AnthropicMessages => {
+                unreachable!(
+                    "ResponsesClient should not be constructed with AnthropicMessages wire api"
+                )
+            }
         }
     }
 

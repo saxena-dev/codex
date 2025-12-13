@@ -39,6 +39,10 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     Responses,
 
+    /// The Anthropic Messages API exposed at `/v1/messages`.
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+
     /// Regular Chat Completions compatible with `/v1/chat/completions`.
     #[default]
     Chat,
@@ -153,6 +157,7 @@ impl ModelProviderInfo {
             query_params: self.query_params.clone(),
             wire: match self.wire_api {
                 WireApi::Responses => ApiWireApi::Responses,
+                WireApi::AnthropicMessages => ApiWireApi::AnthropicMessages,
                 WireApi::Chat => ApiWireApi::Chat,
             },
             headers,
@@ -408,6 +413,52 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
         assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    fn test_deserialize_anthropic_provider_and_to_api_provider() {
+        let toml = r#"
+name = "Anthropic"
+base_url = "https://api.anthropic.com/v1"
+wire_api = "anthropic-messages"
+http_headers     = { "anthropic-version" = "2023-06-01" }
+env_http_headers = { "x-api-key" = "ANTHROPIC_API_KEY" }
+        "#;
+
+        let expected_provider = ModelProviderInfo {
+            name: "Anthropic".into(),
+            base_url: Some("https://api.anthropic.com/v1".into()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::AnthropicMessages,
+            query_params: None,
+            http_headers: Some(maplit::hashmap! {
+                "anthropic-version".to_string() => "2023-06-01".to_string(),
+            }),
+            env_http_headers: Some(maplit::hashmap! {
+                "x-api-key".to_string() => "ANTHROPIC_API_KEY".to_string(),
+            }),
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+        };
+
+        let provider: ModelProviderInfo = toml::from_str(toml).unwrap();
+        assert_eq!(expected_provider, provider);
+
+        let api_provider = provider.to_api_provider(None).expect("api provider");
+        assert_eq!(api_provider.wire, ApiWireApi::AnthropicMessages);
+        assert_eq!(api_provider.base_url, "https://api.anthropic.com/v1");
+
+        let headers = api_provider.headers;
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|h| h.to_str().ok()),
+            Some("2023-06-01")
+        );
     }
 
     #[test]

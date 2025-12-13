@@ -1,3 +1,4 @@
+pub mod anthropic_messages;
 pub mod chat;
 pub mod compact;
 pub mod models;
