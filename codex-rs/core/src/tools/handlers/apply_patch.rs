@@ -64,7 +64,9 @@ impl ToolHandler for ApplyPatchHandler {
             ToolPayload::Function { arguments } => {
                 let args: ApplyPatchToolArgs = serde_json::from_str(&arguments).map_err(|e| {
                     FunctionCallError::RespondToModel(format!(
-                        "failed to parse function arguments: {e:?}"
+                        "failed to parse function arguments: {e:?}. `apply_patch` is a JSON \
+                         function tool that requires a single `input` string field containing \
+                         the full patch body."
                     ))
                 })?;
                 args.input

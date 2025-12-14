@@ -11,6 +11,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,6 +53,12 @@ struct AnthropicErrorBody {
     code: Option<String>,
 }
 
+#[derive(Debug)]
+struct ToolUseState {
+    content_block: Value,
+    input_json_buffer: Option<String>,
+}
+
 pub fn spawn_anthropic_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
@@ -77,6 +84,7 @@ async fn process_anthropic_sse(
     let mut usage: Option<TokenUsage> = None;
     let mut completed_sent = false;
     let mut text_item_started = false;
+    let mut tool_use_blocks: HashMap<i64, ToolUseState> = HashMap::new();
 
     loop {
         let start = Instant::now();
@@ -147,6 +155,7 @@ async fn process_anthropic_sse(
             "message_start" => {
                 full_text.clear();
                 text_item_started = false;
+                tool_use_blocks.clear();
                 if let Some(message) = value.get("message")
                     && let Some(id) = message.get("id").and_then(Value::as_str)
                 {
@@ -159,19 +168,40 @@ async fn process_anthropic_sse(
                         .get("type")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if block_type == "tool_use"
-                        && let Err(err) =
-                            handle_tool_use_block(&tx_event, content_block.to_owned()).await
-                    {
-                        let _ = tx_event.send(Err(err)).await;
-                        return;
+                    if block_type == "tool_use" {
+                        if let Some(index) = value.get("index").and_then(Value::as_i64) {
+                            tool_use_blocks.insert(
+                                index,
+                                ToolUseState {
+                                    content_block: content_block.to_owned(),
+                                    input_json_buffer: None,
+                                },
+                            );
+                        } else {
+                            let _ = tx_event
+                                .send(Err(ApiError::Stream(
+                                    "tool_use content_block_start missing index field".to_string(),
+                                )))
+                                .await;
+                            return;
+                        }
                     }
                 }
             }
             "content_block_delta" => {
                 if let Some(delta) = value.get("delta") {
                     let delta_type = delta.get("type").and_then(Value::as_str);
-                    if (delta_type == Some("text")
+                    if delta_type == Some("input_json_delta") {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                            if let Some(index) = value.get("index").and_then(Value::as_i64) {
+                                if let Some(state) = tool_use_blocks.get_mut(&index) {
+                                    let buffer =
+                                        state.input_json_buffer.get_or_insert_with(String::new);
+                                    buffer.push_str(partial);
+                                }
+                            }
+                        }
+                    } else if (delta_type == Some("text")
                         || delta_type == Some("text_delta")
                         || delta_type.is_none())
                         && let Some(text) = delta.get("text").and_then(Value::as_str)
@@ -204,7 +234,38 @@ async fn process_anthropic_sse(
                 }
             }
             "message_delta" => {}
-            "content_block_stop" => {}
+            "content_block_stop" => {
+                if let Some(index) = value.get("index").and_then(Value::as_i64) {
+                    if let Some(mut state) = tool_use_blocks.remove(&index) {
+                        if let Some(buffer) = state.input_json_buffer.take() {
+                            if !buffer.is_empty() {
+                                match serde_json::from_str::<Value>(&buffer) {
+                                    Ok(input_value) => {
+                                        if let Some(obj) = state.content_block.as_object_mut() {
+                                            obj.insert("input".to_string(), input_value);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = tx_event
+                                            .send(Err(ApiError::Stream(format!(
+                                                "failed to parse tool_use input_json_delta: {err}"
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Err(err) =
+                            handle_tool_use_block(&tx_event, state.content_block).await
+                        {
+                            let _ = tx_event.send(Err(err)).await;
+                            return;
+                        }
+                    }
+                }
+            }
             "message_stop" => {
                 if let Some(message) = value.get("message") {
                     if response_id.is_none()

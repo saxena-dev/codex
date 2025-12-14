@@ -256,6 +256,118 @@ async fn anthropic_tool_use_stream_emits_function_call_and_completed() -> Result
 }
 
 #[tokio::test]
+async fn anthropic_tool_use_input_json_delta_stream_emits_full_arguments() -> Result<()> {
+    let message_start = json!({
+        "type": "message_start",
+        "message": { "id": "msg_tool_stream", "role": "assistant" }
+    });
+
+    let tool_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "apply_patch",
+            "input": {}
+        }
+    });
+
+    let delta1 = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"patch\":\"*** Begin Patch"
+        }
+    });
+
+    let delta2 = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": "\"}"
+        }
+    });
+
+    let tool_stop = json!({
+        "type": "content_block_stop",
+        "index": 0
+    });
+
+    let message_stop = json!({
+        "type": "message_stop",
+        "message": {
+            "id": "msg_tool_stream",
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }
+        }
+    });
+
+    let body = build_anthropic_body(vec![
+        message_start,
+        tool_start,
+        delta1,
+        delta2,
+        tool_stop,
+        message_stop,
+    ]);
+
+    let mut stream = spawn_stream(body);
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev?);
+    }
+
+    let events: Vec<ResponseEvent> = events
+        .into_iter()
+        .filter(|ev| !matches!(ev, ResponseEvent::RateLimits(_)))
+        .collect();
+
+    assert_eq!(events.len(), 2);
+
+    match &events[0] {
+        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        }) => {
+            assert_eq!(name, "apply_patch");
+            assert_eq!(call_id, "call_1");
+            let args: Value = serde_json::from_str(arguments)?;
+            assert_eq!(args, json!({ "patch": "*** Begin Patch" }));
+        }
+        other => panic!("unexpected first event: {other:?}"),
+    }
+
+    match &events[1] {
+        ResponseEvent::Completed {
+            response_id,
+            token_usage,
+        } => {
+            assert_eq!(response_id, "msg_tool_stream");
+            let usage = token_usage
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected token usage in Completed"));
+            assert_eq!(usage.input_tokens, 5);
+            assert_eq!(usage.cached_input_tokens, 0);
+            assert_eq!(usage.output_tokens, 2);
+            assert_eq!(usage.reasoning_output_tokens, 0);
+            assert_eq!(usage.total_tokens, 7);
+        }
+        other => panic!("unexpected second event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn anthropic_error_event_produces_stream_error() -> Result<()> {
     let error_event = json!({
         "type": "error",

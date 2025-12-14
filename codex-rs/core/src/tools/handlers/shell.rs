@@ -182,9 +182,11 @@ impl ToolHandler for ShellCommandHandler {
                 "unsupported payload for shell_command handler: {tool_name}"
             )));
         };
-
         let params: ShellCommandToolCallParams = serde_json::from_str(&arguments).map_err(|e| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e:?}"))
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {e:?}. `shell_command` requires a \
+                     `command` string field in its JSON arguments."
+            ))
         })?;
         let exec_params = Self::to_exec_params(params, session.as_ref(), turn.as_ref());
         ShellHandler::run_exec_like(

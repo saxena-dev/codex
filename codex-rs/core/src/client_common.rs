@@ -5,11 +5,13 @@ pub use codex_api::common::ResponseEvent;
 use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -236,6 +238,10 @@ fn compute_anthropic_max_tokens(model_family: &ModelFamily) -> i64 {
     // quarter for output. When no context window is known, fall back to a
     // conservative default.
     const DEFAULT_MAX_TOKENS: i64 = 1_024;
+    // Empirical ceiling from current Claude models (including Claude Opus on
+    // Azure AI Foundry). This keeps us under provider-enforced limits even
+    // when the effective context window is very large.
+    const MAX_OUTPUT_TOKENS: i64 = 64_000;
 
     let effective_context_window = model_family
         .context_window
@@ -246,7 +252,7 @@ fn compute_anthropic_max_tokens(model_family: &ModelFamily) -> i64 {
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     if candidate > 0 {
-        candidate
+        candidate.min(MAX_OUTPUT_TOKENS)
     } else {
         DEFAULT_MAX_TOKENS
     }
@@ -254,6 +260,18 @@ fn compute_anthropic_max_tokens(model_family: &ModelFamily) -> i64 {
 
 fn response_items_to_anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
     let mut messages = Vec::new();
+
+    // Build a lookup table from call_id -> output so we can always emit a
+    // tool_result message immediately after the corresponding tool_use,
+    // satisfying Anthropic's requirement that each tool_use id has a
+    // tool_result in the *next* message.
+    let mut outputs_by_call_id: HashMap<String, &FunctionCallOutputPayload> = HashMap::new();
+    for item in items {
+        if let ResponseItem::FunctionCallOutput { call_id, output } = item {
+            outputs_by_call_id.insert(call_id.clone(), output);
+        }
+    }
+    let mut consumed_outputs: HashSet<String> = HashSet::new();
 
     for item in items {
         match item {
@@ -294,41 +312,49 @@ fn response_items_to_anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
                         "input": input,
                     }],
                 }));
-            }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
-                let inner_content: Vec<Value> = if let Some(items) = &output.content_items {
-                    items
-                        .iter()
-                        .map(|item| match item {
-                            FunctionCallOutputContentItem::InputText { text } => {
-                                serde_json::json!({
-                                    "type": "text",
-                                    "text": text,
-                                })
-                            }
-                            FunctionCallOutputContentItem::InputImage { image_url } => {
-                                serde_json::json!({
-                                    "type": "text",
-                                    "text": image_url,
-                                })
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![serde_json::json!({
-                        "type": "text",
-                        "text": output.content,
-                    })]
-                };
 
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": inner_content,
-                    }],
-                }));
+                if let Some(output) = outputs_by_call_id.get(call_id) {
+                    let inner_content: Vec<Value> = if let Some(items) = &output.content_items {
+                        items
+                            .iter()
+                            .map(|item| match item {
+                                FunctionCallOutputContentItem::InputText { text } => {
+                                    serde_json::json!({
+                                        "type": "text",
+                                        "text": text,
+                                    })
+                                }
+                                FunctionCallOutputContentItem::InputImage { image_url } => {
+                                    serde_json::json!({
+                                        "type": "text",
+                                        "text": image_url,
+                                    })
+                                }
+                            })
+                            .collect()
+                    } else {
+                        vec![serde_json::json!({
+                            "type": "text",
+                            "text": output.content,
+                        })]
+                    };
+
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": inner_content,
+                        }],
+                    }));
+
+                    consumed_outputs.insert(call_id.clone());
+                }
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                if consumed_outputs.contains(call_id) {
+                    continue;
+                }
             }
             ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }

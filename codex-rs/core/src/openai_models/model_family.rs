@@ -323,6 +323,20 @@ pub fn find_family_for_model(slug: &str) -> ModelFamily {
             truncation_policy: TruncationPolicy::Bytes(10_000),
             context_window: Some(CONTEXT_WINDOW_272K),
         )
+    } else if slug.starts_with("claude") {
+        // Anthropic Claude models (including Azure AI Foundry deployments).
+        //
+        // - Use the simpler `shell_command` tool shape.
+        // - Enable parallel tool calls.
+        // - Provide `apply_patch` as a JSON function tool so it appears in
+        //   Anthropic `tools` with an explicit `input_schema`.
+        let family = model_family!(
+            slug, slug,
+            shell_type: ConfigShellToolType::ShellCommand,
+            supports_parallel_tool_calls: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Function),
+        );
+        family
     } else {
         derive_default_model_family(slug)
     }
